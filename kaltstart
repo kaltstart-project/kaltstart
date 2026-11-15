@@ -1,0 +1,1350 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 The kaltstart developers
+"""kaltstart - unlock a remote LUKS root with a FIDO2 token that stays local.
+
+The token is never exposed to the server. This workstation tool asks the
+token for an hmac-secret value (fido2-assert from fido2-tools) and pipes the
+result, as an ordinary LUKS passphrase, into Debian's stock cryptroot-unlock
+over SSH (dropbear-initramfs). There is no custom code on the server.
+
+Secret handling: the passphrase lives only in process memory and on stdin
+pipes of child processes. It never appears in argv, the environment, local
+files, log output or exception messages.
+"""
+
+import argparse
+import base64
+import configparser
+import contextlib
+import hashlib
+import os
+import re
+import resource
+import secrets
+import select
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from dataclasses import dataclass
+from typing import List, Optional
+
+__version__ = "0.1.0.dev0"
+
+EXIT_USAGE = 2      # usage or configuration error
+EXIT_TOKEN = 3      # fido2 tools missing, no or ambiguous device, no usable secret
+EXIT_SSH = 4        # ssh / transport error
+EXIT_REJECTED = 5   # the server rejected the passphrase, did not read it or did not confirm it
+EXIT_TIMEOUT = 6    # port never opened, or system did not come up
+
+RETRY_INTERVAL = 2.0    # seconds between TCP connect attempts
+CONNECT_TIMEOUT = 5.0   # seconds for a single TCP connect attempt
+SECRET_LENGTH = 44      # base64 text of a 32-byte hmac-secret output
+RELAY_GRACE = 5.0       # seconds to wait for the rest of ssh's error output
+SESSION_LIMIT = 300.0   # seconds after which an ssh run without a terminal is ended
+OUTPUT_LIMIT = 1 << 20  # bytes of remote output that are kept; a run that sends more is ended
+LINE_LIMIT = 4096       # longer lines of ssh's error output are printed in pieces
+TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+REDACTED = b"[passphrase removed]"
+CRED_PROTECT_UV_REQUIRED = "3"  # credProtect level userVerificationRequired
+CRYPTSETUP_NO_KEY = 2   # cryptsetup exit status: no keyslot opens with the passphrase
+KEYSLOT_RE = re.compile(rb"Key slot ([0-9]+) unlocked")  # printed by cryptsetup --verbose
+# Output of cryptroot-unlock (cryptsetup-initramfs) that unlock relies on:
+UNLOCK_PROMPT = b"Please unlock disk"  # stdout, immediately before the passphrase is read
+UNLOCK_GAVE_UP = b"Timeout reached while waiting for PID"  # stderr, cryptsetup still running after 10 s
+
+VERBOSE = False
+
+
+class Failure(Exception):
+    """An expected failure with a one-line message and an exit code.
+
+    The message must never contain the passphrase.
+    """
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def say(text):
+    """Print a message. A terminal or pipe that has gone away must not stop the cleanup."""
+    try:
+        print(f"kaltstart: {text}", file=sys.stderr, flush=True)
+    except OSError:
+        pass
+
+
+def show_command(argv):
+    """Print a command line in verbose mode. Command lines never hold the secret."""
+    if VERBOSE:
+        say("run: " + shlex.join(argv))
+
+
+def escape_control(text):
+    """Make untrusted text safe for a terminal (one line, no control characters).
+
+    The backslash is escaped as well, so that the result is unambiguous.
+    """
+    out = []
+    for char in text:
+        code = ord(char)
+        if char == "\\":
+            out.append("\\\\")
+        elif char == " " or char.isprintable():
+            out.append(char)
+        elif code < 0x100:
+            out.append(f"\\x{code:02x}")
+        elif code < 0x10000:
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(f"\\U{code:08x}")
+    return "".join(out)
+
+
+def b64(raw):
+    return base64.b64encode(raw).decode("ascii")
+
+
+# --------------------------------------------------------------------------
+# Value validation. Every check takes the value and a "where" string that
+# names section and key, and raises Failure(EXIT_USAGE) on bad input.
+# --------------------------------------------------------------------------
+
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+HOST_RE = re.compile(r"[A-Za-z0-9:][A-Za-z0-9._:-]{0,252}")
+USER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9._-]{0,31}")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Local paths end up in ssh options, where white space, quotes and % have a meaning.
+UNSAFE_PATH_RE = re.compile(r"[\x00-\x20\x7f-\x9f\"'%#]")
+
+
+def bad(where, problem):
+    return Failure(EXIT_USAGE, f"{where}: {problem}")
+
+
+def check_name(value, where):
+    if not NAME_RE.fullmatch(value):
+        raise bad(where, "invalid name (allowed: letters, digits, '.', '_', '-'; at most 64 characters)")
+    return value
+
+
+def check_host(value, where):
+    if not HOST_RE.fullmatch(value):
+        raise bad(where, "invalid host name or address")
+    # The resolver refuses empty or over-long labels with a UnicodeError.
+    # One trailing dot is fine.
+    labels = value.split(".")
+    if any(not 0 < len(label) < 64 for label in labels[:-1]) or len(labels[-1]) >= 64:
+        raise bad(where, "invalid host name (empty label or label longer than 63 characters)")
+    return value
+
+
+def check_user(value, where):
+    if not USER_RE.fullmatch(value):
+        raise bad(where, "invalid user name")
+    return value
+
+
+def check_int(value, where, low, high):
+    if not re.fullmatch(r"[0-9]{1,9}", value) or not low <= int(value) <= high:
+        raise bad(where, f"must be an integer between {low} and {high}")
+    return int(value)
+
+
+def check_port(value, where):
+    return check_int(value, where, 1, 65535)
+
+
+def check_bool(value, where):
+    lowered = value.lower()
+    if lowered in ("1", "yes", "true", "on"):
+        return True
+    if lowered in ("0", "no", "false", "off"):
+        return False
+    raise bad(where, "must be yes or no")
+
+
+def check_text(value, where):
+    """A non-empty single-line string that cannot be mistaken for an option."""
+    if not value or value != value.strip() or CONTROL_RE.search(value) or value.startswith("-"):
+        raise bad(where, "must be a non-empty single-line value without surrounding white space "
+                  "that does not start with '-'")
+    return value
+
+
+def check_local_path(value, where):
+    """A local path for an ssh option. A relative path would depend on the current directory."""
+    path = os.path.expanduser(value)
+    if UNSAFE_PATH_RE.search(path):
+        raise bad(where, "path must not contain white space, quotes, '%', '#' or control characters")
+    if not os.path.isabs(path):
+        raise bad(where, "must be an absolute path, or start with '~'")
+    return path
+
+
+def check_server_path(value, where):
+    if not value.startswith("/") or CONTROL_RE.search(value):
+        raise bad(where, "must be an absolute path on the server")
+    return value
+
+
+def check_b64(value, where, length=None):
+    """Strict, canonical base64. Returns the decoded bytes."""
+    try:
+        raw = base64.b64decode(value.encode("ascii"), validate=True)
+    except ValueError:  # includes binascii.Error and UnicodeEncodeError
+        raise bad(where, "not valid base64") from None
+    if not raw or b64(raw) != value:
+        raise bad(where, "not valid base64")
+    if length is not None and len(raw) != length:
+        raise bad(where, f"must be base64 of exactly {length} bytes (got {len(raw)})")
+    return raw
+
+
+# The ssh options that ssh_options and admin_ssh_options may hold. A flag,
+# unlike "-o", sets its option directly and would override the options this
+# program forces, so only flags that cannot switch a forwarding or connection
+# sharing on are accepted. Everything else is available through "-o".
+SSH_FLAGS = "46Cqv"
+SSH_FLAGS_WITH_ARGUMENT = "bBcEFiIJmoP"
+SSH_FLAG_REASONS = {
+    "A": "agent forwarding is switched off for this connection",
+    "X": "X11 forwarding is switched off for this connection",
+    "Y": "X11 forwarding is switched off for this connection",
+    "M": "connection sharing is switched off for this connection",
+    "S": "connection sharing is switched off for this connection",
+    "O": "connection sharing is switched off for this connection",
+    "p": "the port is set with its own key",
+    "l": "the user is set with its own key",
+}
+
+
+def check_options(value, where):
+    """Additional ssh arguments, split like a shell command line.
+
+    Only the options named above and their arguments are accepted. Anything
+    else would shift the destination and the remote command that follow on
+    the command line, or undo an option that must not be overridden.
+    """
+    try:
+        words = shlex.split(value)
+    except ValueError as exc:
+        raise bad(where, f"cannot be split into arguments ({exc})") from None
+    argument_expected = False
+    for word in words:
+        if argument_expected:
+            argument_expected = False
+            continue
+        if len(word) < 2 or not word.startswith("-") or word.startswith("--"):
+            raise bad(where, f"'{escape_control(word)}' is neither an option of ssh nor the argument of one")
+        for position, flag in enumerate(word[1:], start=2):
+            if flag in SSH_FLAGS_WITH_ARGUMENT:
+                argument_expected = position == len(word)  # otherwise the rest of the word is the argument
+                break
+            if flag not in SSH_FLAGS:
+                reason = SSH_FLAG_REASONS.get(flag, "only -4 -6 -C -q -v and, with an argument, "
+                                              "-b -B -c -E -F -i -I -J -m -o -P are accepted")
+                raise bad(where, f"-{escape_control(flag)} is not allowed: {reason}")
+    if argument_expected:
+        raise bad(where, f"'{escape_control(words[-1])}' lacks its argument")
+    return words
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+TOKEN_KEYS = {"rp_id", "credential_id", "pin", "device"}
+HOST_KEYS = {
+    # initramfs connection
+    "host", "port", "user", "salt", "token", "identity", "known_hosts", "remote_command",
+    "prompts", "probe", "booted_port", "ssh_options",
+    # running system
+    "admin_host", "admin_port", "admin_user", "admin_sudo", "admin_ssh_options", "devices",
+}
+
+
+@dataclass
+class Token:
+    name: str
+    rp_id: str
+    credential_id: str
+    pin: bool
+    device: Optional[str]
+
+
+@dataclass
+class Host:
+    name: str
+    host: str
+    port: int
+    user: str
+    identity: Optional[str]
+    known_hosts: Optional[str]
+    salt: str
+    token: Optional[str]
+    remote_command: str
+    prompts: int
+    booted_port: Optional[int]
+    probe: bool
+    ssh_options: List[str]
+    admin_host: str
+    admin_port: Optional[int]
+    admin_user: str
+    admin_sudo: bool
+    admin_ssh_options: List[str]
+    devices: List[str]
+
+
+class Section:
+    """Typed access to the raw key/value pairs of one config section."""
+
+    def __init__(self, header, raw, known_keys):
+        self.header = f"[{header}]"
+        self.raw = raw
+        for key in raw:
+            if key not in known_keys:
+                raise bad(f"{self.header} {escape_control(key)}", "unknown key")
+
+    def get(self, key, check, default=None, *extra):
+        value = self.raw.get(key, "").strip()
+        if not value:
+            return default
+        return check(value, f"{self.header} {key}", *extra)
+
+    def need(self, key, check, *extra):
+        value = self.get(key, check, None, *extra)
+        if value is None:
+            raise bad(f"{self.header} {key}", "required key is missing")
+        return value
+
+
+def parse_token(name, raw):
+    sec = Section(f"token {name}", raw, TOKEN_KEYS)
+    credential_id = sec.need("credential_id", lambda v, w: (check_b64(v, w), v)[1])
+    return Token(
+        name=name,
+        rp_id=sec.get("rp_id", check_text, "kaltstart"),
+        credential_id=credential_id,
+        pin=sec.get("pin", check_bool, True),
+        device=sec.get("device", check_text),
+    )
+
+
+def parse_host(name, raw):
+    sec = Section(f"host {name}", raw, HOST_KEYS)
+    host = sec.need("host", check_host)
+    devices = [check_server_path(dev, f"{sec.header} devices")
+               for dev in re.split(r"[,\s]+", raw.get("devices", "")) if dev]
+    return Host(
+        name=name,
+        host=host,
+        port=sec.get("port", check_port, 22),
+        user=sec.get("user", check_user, "root"),
+        identity=sec.get("identity", check_local_path),
+        known_hosts=sec.get("known_hosts", check_local_path),
+        salt=sec.need("salt", lambda v, w: (check_b64(v, w, 32), v)[1]),
+        token=sec.get("token", check_name),
+        remote_command=sec.get("remote_command", check_text, "cryptroot-unlock"),
+        prompts=sec.get("prompts", check_int, 1, 1, 1000),
+        booted_port=sec.get("booted_port", check_port),
+        probe=sec.get("probe", check_bool, True),
+        ssh_options=sec.get("ssh_options", check_options, []),
+        admin_host=sec.get("admin_host", check_host, host),
+        admin_port=sec.get("admin_port", check_port),
+        admin_user=sec.get("admin_user", check_user, "root"),
+        admin_sudo=sec.get("admin_sudo", check_bool, False),
+        admin_ssh_options=sec.get("admin_ssh_options", check_options, []),
+        devices=devices,
+    )
+
+
+class Config:
+    """The parsed configuration file. Sections are validated when they are used."""
+
+    def __init__(self, path):
+        self.path = path
+        self.missing = False  # the file does not exist
+        self.tokens = {}  # name -> raw dict
+        self.hosts = {}   # name -> raw dict
+
+    def where(self):
+        return f"{self.path} (the file does not exist)" if self.missing else self.path
+
+    def token(self, name):
+        if name not in self.tokens:
+            raise Failure(EXIT_USAGE, f"no [token {name}] section in {self.where()}")
+        return parse_token(name, self.tokens[name])
+
+    def host(self, name):
+        if name not in self.hosts:
+            raise Failure(EXIT_USAGE, f"no [host {name}] section in {self.where()}")
+        return parse_host(name, self.hosts[name])
+
+    def token_for(self, host, override):
+        """--token, else the host's token key, else the only token section."""
+        name = override or host.token
+        if name is None:
+            if not self.tokens:
+                raise Failure(EXIT_USAGE, f"no [token ...] section in {self.where()}; create one with 'kaltstart init'")
+            if len(self.tokens) != 1:
+                raise Failure(EXIT_USAGE, f"[host {host.name}] names no token and {self.where()} has "
+                              f"{len(self.tokens)} token sections; set the token key of the host or use --token")
+            name = next(iter(self.tokens))
+        return self.token(name)
+
+
+def default_config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "kaltstart", "config.ini")
+
+
+def access_problem(status):
+    """Judge owner and mode of the configuration file from its stat result.
+
+    Returns (refuse, text). The file is refused if someone else can change
+    it: its content decides where the passphrase is sent and which ssh
+    options are used. Read access for others only earns a warning.
+    """
+    mode = stat.S_IMODE(status.st_mode)
+    if status.st_uid not in (os.geteuid(), 0):
+        return True, "is owned by another user"
+    if mode & 0o022:
+        return True, f"is writable by group or others (mode {mode:04o})"
+    if mode & 0o077:
+        return False, f"is accessible by group or others (mode {mode:04o})"
+    return False, None
+
+
+def load_config(path, warn=True):
+    config = Config(path)
+    # Without a default section "[DEFAULT]" is a section like any other and
+    # is refused below; configparser would copy its keys into every section.
+    parser = configparser.ConfigParser(interpolation=None, default_section="")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            refuse, problem = access_problem(os.fstat(handle.fileno()))
+            if refuse:
+                raise Failure(EXIT_USAGE, f"{path} {problem}; refusing to use it (chmod 600 {shlex.quote(path)})")
+            parser.read_file(handle)
+        if warn and problem:
+            say(f"warning: {path} {problem}; run: chmod 600 {shlex.quote(path)}")
+    except FileNotFoundError:
+        config.missing = True
+        return config
+    except (OSError, UnicodeError, configparser.Error) as exc:
+        raise Failure(EXIT_USAGE, f"cannot read {path}: {escape_control(str(exc))}") from None
+    for section in parser.sections():
+        parts = section.split()
+        if len(parts) != 2 or parts[0] not in ("token", "host"):
+            raise bad(f"[{escape_control(section)}]", "unknown section (expected [token NAME] or [host NAME])")
+        check_name(parts[1], f"[{escape_control(section)}]")
+        target = config.tokens if parts[0] == "token" else config.hosts
+        if parts[1] in target:
+            raise bad(f"[{escape_control(section)}]", "section is defined twice")
+        target[parts[1]] = dict(parser.items(section))
+    return config
+
+
+def hosts_with_salt_of(config, name):
+    """Names of the other host sections that use the same salt as host NAME.
+
+    With the same token such sections yield the same passphrase. That is
+    intended only if they describe the same server.
+    """
+    salt = config.hosts[name].get("salt", "").strip()
+    return [other for other, raw in config.hosts.items()
+            if other != name and salt and raw.get("salt", "").strip() == salt]
+
+
+def check_writable(path):
+    """Fail early if the configuration file cannot be created or extended."""
+    probe = path
+    while not os.path.exists(probe):
+        probe = os.path.dirname(probe) or "."
+    need = os.W_OK | (os.X_OK if os.path.isdir(probe) else 0)
+    if not os.access(probe, need):
+        raise Failure(EXIT_USAGE, f"cannot write {path}: no write permission for {probe}")
+
+
+def append_section(path, header, values):
+    """Append one new section. Existing content is never rewritten."""
+    text = f"[{header}]\n" + "".join(f"{key} = {value}\n" for key, value in values.items())
+    try:
+        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "r+b") as handle:
+            old = handle.read()
+            if old:
+                text = ("\n" if old.endswith(b"\n") else "\n\n") + text
+            handle.write(text.encode("utf-8"))
+    except OSError as exc:
+        raise Failure(EXIT_USAGE, f"cannot write {path}: {exc.strerror}") from None
+
+
+# --------------------------------------------------------------------------
+# Token (fido2-tools)
+# --------------------------------------------------------------------------
+
+def find_tool(name, code):
+    path = shutil.which(name)
+    if not path:
+        hint = " (install fido2-tools)" if name.startswith("fido2-") else ""
+        raise Failure(code, f"{name} not found in PATH{hint}")
+    return path
+
+
+def detect_device():
+    """Return the only FIDO2 device listed by 'fido2-token -L'."""
+    argv = [find_tool("fido2-token", EXIT_TOKEN), "-L"]
+    show_command(argv)
+    proc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise Failure(EXIT_TOKEN, f"fido2-token -L failed with exit status {proc.returncode}")
+    # Line format: "/dev/hidraw5: vendor=0x1050, product=0x0407 (Yubico YubiKey ...)"
+    lines = [line for line in proc.stdout.decode("utf-8", "replace").splitlines() if ": vendor=" in line]
+    devices = [line.split(": vendor=", 1)[0].strip() for line in lines]
+    if len(devices) == 1:
+        return devices[0]
+    if not devices:
+        raise Failure(EXIT_TOKEN, "no FIDO2 device found; plug in the token or pass --device")
+    for line in lines:
+        say("found: " + escape_control(line))
+    raise Failure(EXIT_TOKEN, f"{len(devices)} FIDO2 devices found; choose one with --device")
+
+
+def pick_device(option, token):
+    device = option or (token.device if token else None) or detect_device()
+    if not device or device.startswith("-") or CONTROL_RE.search(device):
+        raise Failure(EXIT_TOKEN, "invalid FIDO2 device path")
+    return device
+
+
+def run_fido_tool(argv, params, device):
+    """Run a fido2 tool with a parameter file and return (exit status, stdout).
+
+    The parameter file is not secret. It lives in a private temporary
+    directory that is removed afterwards. stdin and stderr are inherited so
+    the tool can ask for the PIN on the terminal.
+    """
+    with tempfile.TemporaryDirectory(prefix="kaltstart-") as directory:
+        param_file = os.path.join(directory, "params")
+        fd = os.open(param_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("".join(line + "\n" for line in params))
+        argv = argv + ["-i", param_file, device]
+        show_command(argv)
+        proc = subprocess.run(argv, stdout=subprocess.PIPE)
+    return proc.returncode, proc.stdout
+
+
+def is_hmac_secret(candidate):
+    """True if candidate (bytes) is strict base64 of exactly 32 bytes."""
+    if len(candidate) != SECRET_LENGTH:
+        return False
+    try:
+        raw = base64.b64decode(candidate, validate=True)
+    except ValueError:
+        return False
+    return len(raw) == 32 and base64.b64encode(raw) == candidate
+
+
+def derive_passphrase(token, host, device_option):
+    """Ask the token for the hmac-secret value. Returns the passphrase as 44 ASCII bytes."""
+    tool = find_tool("fido2-assert", EXIT_TOKEN)
+    device = pick_device(device_option, token)
+    argv = [tool, "-G", "-h", "-t", "up=true"]
+    if token.pin:
+        argv += ["-t", "pin=true"]
+    client_data_hash = b64(os.urandom(32))
+    params = [client_data_hash, token.rp_id, token.credential_id, host.salt]
+    say(f"asking token '{token.name}' on {device}: enter the PIN if asked, then touch the token")
+    status, output = run_fido_tool(argv, params, device)
+    if status != 0:
+        raise Failure(EXIT_TOKEN, f"fido2-assert failed with exit status {status}")
+    lines = [line.strip() for line in output.split(b"\n") if line.strip()]
+    secret = lines[-1] if lines else b""
+    # The first output line echoes the client data hash of the request, which
+    # is also base64 of 32 bytes: never mistake a truncated output for the secret.
+    if not is_hmac_secret(secret) or secret == client_data_hash.encode("ascii"):
+        raise Failure(EXIT_TOKEN, "the token returned no usable hmac-secret value")
+    return secret
+
+
+# --------------------------------------------------------------------------
+# SSH transport
+# --------------------------------------------------------------------------
+
+def port_open(host, port):
+    try:
+        socket.create_connection((host, port), timeout=CONNECT_TIMEOUT).close()
+        return True
+    except OSError:
+        return False
+
+
+def wait_for_port(host, port, seconds):
+    """Plain TCP probe, retried until the deadline. seconds == 0 means one attempt."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if port_open(host, port):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(RETRY_INTERVAL, remaining))
+
+
+def same_machine(first, second):
+    """True if two host names or addresses are equal or resolve to a common address."""
+    if first.rstrip(".").lower() == second.rstrip(".").lower():
+        return True
+    try:
+        found = [{info[4][0] for info in socket.getaddrinfo(name, None)} for name in (first, second)]
+    except OSError:
+        return False
+    return bool(found[0] & found[1])
+
+
+# Options that precede everything the user can configure. ssh uses the first
+# value it obtains for an option, so these cannot be overridden by ssh_options
+# or by the user's ssh configuration. The host key must be known beforehand
+# and is checked by this very ssh process: no key is accepted on trust, none
+# is learned from the server or from DNS, and no connection opened earlier
+# under other rules is shared. The session offers the remote side neither the
+# agent nor the X11 display nor a port forwarding.
+FORCED_SSH_OPTIONS = ["-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no", "-o", "VerifyHostKeyDNS=no",
+                      "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                      "-o", "ForwardAgent=no", "-o", "ForwardX11=no", "-o", "ClearAllForwardings=yes"]
+# In addition for the initramfs, which only ever takes a key: a server that
+# is not the genuine one must not be able to show a prompt of its own.
+INITRAMFS_SSH_OPTIONS = ["-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no"]
+# Defaults that follow the configured options and yield to them: a connection
+# attempt and a session that no longer answers end after a bounded time.
+DEFAULT_SSH_OPTIONS = ["-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"]
+
+
+def unlock_argv(ssh, host):
+    """ssh command line for the initramfs. All options precede the destination."""
+    argv = [ssh, "-T", "-p", str(host.port)] + FORCED_SSH_OPTIONS + INITRAMFS_SSH_OPTIONS
+    if host.known_hosts:
+        # The dedicated file is then the only source of host keys.
+        argv += ["-o", f"UserKnownHostsFile={host.known_hosts}", "-o", "GlobalKnownHostsFile=/dev/null"]
+    if host.identity:
+        argv += ["-o", "IdentitiesOnly=yes", "-i", host.identity]
+    # "--" ends the options: ssh reads nothing after the destination as an option.
+    return argv + host.ssh_options + DEFAULT_SSH_OPTIONS + ["--", f"{host.user}@{host.host}", host.remote_command]
+
+
+def admin_argv(ssh, host, remote_command, tty=False):
+    """ssh command line for the running system.
+
+    Identity, known_hosts and, unless admin_port is set, the port come from
+    the user's ssh configuration. The forced options apply here as well: the
+    passphrase travels over this connection during enrollment.
+    """
+    # With a terminal, "-e none" switches off the "~" escape character: an
+    # existing passphrase that starts with "~" must reach cryptsetup unchanged.
+    argv = [ssh] + (["-t", "-e", "none"] if tty else ["-T"])
+    if host.admin_port:
+        argv += ["-p", str(host.admin_port)]
+    return (argv + FORCED_SSH_OPTIONS + host.admin_ssh_options + DEFAULT_SSH_OPTIONS
+            + ["--", f"{host.admin_user}@{host.admin_host}", remote_command])
+
+
+def as_root(host, command, interactive=False):
+    """Prefix a remote command with sudo when the admin user is not root.
+
+    Without a terminal sudo must not ask for a password ("-n"): it would wait
+    for input that never comes.
+    """
+    if not host.admin_sudo:
+        return command
+    return ("sudo " if interactive else "sudo -n ") + command
+
+
+def echo_remote(output):
+    for line in output.decode("utf-8", "replace").splitlines():
+        say("remote: " + escape_control(line))
+
+
+@dataclass
+class Reply:
+    """What an ssh run without a terminal returned. Both texts are free of the passphrase."""
+    status: int
+    output: bytes  # stdout of the remote command
+    errors: bytes  # stderr: messages of ssh itself and of the remote command
+    ended: Optional[str] = None  # why this program ended the run, if it did
+
+
+def relay_errors(stream, secret, collected):
+    """Print what ssh writes to its standard error while it runs.
+
+    That is ssh's own output and the standard error of the remote command.
+    Every line is printed as it arrives, with control characters escaped and
+    the passphrase removed, and is kept in collected up to OUTPUT_LIMIT. A
+    line longer than LINE_LIMIT is printed in pieces; the end of a piece is
+    held back, so that a passphrase that spans two pieces is still found.
+    """
+    kept = 0
+    held = b""
+    with stream:
+        while True:
+            piece = stream.readline(LINE_LIMIT)
+            data = held + piece
+            if secret:
+                data = data.replace(secret, REDACTED)
+            complete = not piece or piece.endswith(b"\n")
+            keep = 0 if complete or not secret else min(len(secret) - 1, len(data))
+            line, held = data[:len(data) - keep], data[len(data) - keep:]
+            if line:
+                if kept < OUTPUT_LIMIT:
+                    collected.append(line)
+                    kept += len(line)
+                say("ssh: " + escape_control(line.decode("utf-8", "replace").rstrip("\r\n")))
+            if not piece:
+                break
+
+
+def exchange(proc, secret):
+    """Give ssh its input, read its stdout and wait for it. Returns (stdout, problem).
+
+    problem is None, or the reason why the run was ended: it took longer than
+    SESSION_LIMIT, or the remote side sent more than OUTPUT_LIMIT bytes.
+    """
+    if secret is not None:
+        try:
+            proc.stdin.write(secret)
+            proc.stdin.close()
+        except OSError:
+            pass  # ssh has exited already; its exit status tells why
+    deadline = time.monotonic() + SESSION_LIMIT
+    late = f"no result within {SESSION_LIMIT:g} s"
+    descriptor = proc.stdout.fileno()
+    chunks, size, problem = [], 0, None
+    while problem is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([descriptor], [], [], remaining)[0]:
+            problem = late
+            break
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > OUTPUT_LIMIT:
+            problem = "the remote side sent more output than this program accepts"
+        else:
+            chunks.append(chunk)
+    if problem is None:
+        try:
+            proc.wait(max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            problem = late
+    if problem is not None:
+        proc.kill()
+    proc.wait()
+    proc.stdout.close()
+    return b"".join(chunks), problem
+
+
+def ssh_run(argv, secret=None, echo=True):
+    """Run ssh without a terminal and return a Reply.
+
+    The secret, if there is one, is the entire stdin (no newline); otherwise
+    stdin is empty. Nothing that ssh or the remote side sends reaches the
+    terminal unfiltered: control characters are escaped, and a remote side
+    that echoes its stdin does not get the secret printed. With echo=False
+    the stdout of the remote command is returned but not printed.
+    """
+    show_command(argv)
+    read_fd, write_fd = os.pipe()
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL if secret is None else subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=write_fd)
+    except BaseException:
+        os.close(read_fd)
+        raise
+    finally:
+        os.close(write_fd)
+    errors = []
+    relay = threading.Thread(target=relay_errors, args=(os.fdopen(read_fd, "rb"), secret, errors), daemon=True)
+    relay.start()
+    try:
+        output, problem = exchange(proc, secret)
+    except BaseException:
+        # Also on Ctrl-C and on a signal: ssh must not go on and deliver the
+        # secret after this program has given up.
+        proc.kill()
+        proc.wait()
+        raise
+    # A process started by ssh can keep the pipe open after ssh has exited.
+    relay.join(RELAY_GRACE)
+    if problem:
+        say(f"ssh was ended: {problem}")
+    if secret:
+        output = output.replace(secret, REDACTED)
+    if echo:
+        echo_remote(output)
+    return Reply(proc.returncode, output, b"".join(errors), problem)
+
+
+def ssh_terminal(argv):
+    """Run ssh with a terminal and return the exit status.
+
+    Used for the one step in which cryptsetup asks for an existing
+    passphrase. The session is interactive; its output is not filtered.
+    """
+    show_command(argv)
+    return subprocess.run(argv, stdout=2).returncode
+
+
+@contextlib.contextmanager
+def signals_ignored():
+    """Ignore the termination signals while a cleanup step runs."""
+    previous = {signum: signal.signal(signum, signal.SIG_IGN) for signum in TERMINATION_SIGNALS}
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def transport_failed(status):
+    return status == 255 or status < 0
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def cmd_init(args):
+    config = load_config(args.config)
+    name = check_name(args.token, "--token")
+    if name in config.tokens:
+        raise Failure(EXIT_USAGE, f"[token {name}] already exists in {config.path}")
+    rp_id = check_text(args.rp_id, "--rp-id")
+    check_writable(config.path)  # before PIN and touch are spent
+    tool = find_tool("fido2-cred", EXIT_TOKEN)
+    device = pick_device(args.device, None)
+    params = [b64(os.urandom(32)), rp_id, "kaltstart", b64(os.urandom(16))]
+    argv = [tool, "-M", "-h"]
+    if not args.no_pin:
+        # With this protection level the token itself refuses to use the
+        # credential without user verification. A token that does not know
+        # the extension ignores it.
+        argv += ["-c", CRED_PROTECT_UV_REQUIRED]
+    say(f"creating a credential on {device}: enter the PIN if asked, then touch the token")
+    status, output = run_fido_tool(argv, params, device)
+    if status != 0:
+        raise Failure(EXIT_TOKEN, f"fido2-cred failed with exit status {status}")
+    lines = output.decode("ascii", "replace").splitlines()
+    values = {"rp_id": rp_id, "credential_id": lines[4].strip() if len(lines) >= 5 else "",
+              "pin": "no" if args.no_pin else "yes"}
+    try:
+        parse_token(name, values)
+    except Failure:
+        raise Failure(EXIT_TOKEN, "fido2-cred did not print a credential ID on line 5") from None
+    append_section(config.path, f"token {name}", values)
+    say(f"added [token {name}] to {config.path}")
+    unbound = [host for host, raw in config.hosts.items() if not raw.get("token", "").strip()]
+    if config.tokens and unbound:
+        verb = "has no token key and needs" if len(unbound) == 1 else "have no token key and need"
+        say(f"note: the file now has several token sections; [host {'], [host '.join(unbound)}] "
+            f"{verb} --token from now on")
+    return 0
+
+
+def cmd_add_host(args):
+    config = load_config(args.config)
+    name = check_name(args.name, "NAME")
+    if name in config.hosts:
+        raise Failure(EXIT_USAGE, f"[host {name}] already exists in {config.path}")
+    values = {"host": args.host, "port": args.port, "user": args.user}
+    # With a single token section the host is tied to it, so that a token
+    # added later does not make the choice ambiguous.
+    token = args.token or (next(iter(config.tokens)) if len(config.tokens) == 1 else None)
+    optional = {"identity": args.identity, "known_hosts": args.known_hosts,
+                "booted_port": args.booted_port, "token": token,
+                "devices": " ".join(args.device_on_server or [])}
+    values.update({key: value for key, value in optional.items() if value})
+    values["salt"] = b64(secrets.token_bytes(32))
+    for key, value in values.items():
+        if CONTROL_RE.search(value):
+            raise bad(f"[host {name}] {key}", "must not contain control characters")
+    parse_host(name, values)  # validate before anything is written
+    if args.token and args.token not in config.tokens:
+        raise Failure(EXIT_USAGE, f"no [token {args.token}] section in {config.where()}")
+    append_section(config.path, f"host {name}", values)
+    say(f"added [host {name}] to {config.path}")
+    return 0
+
+
+def cmd_derive(args):
+    if sys.stdout.isatty() and not args.allow_tty:
+        raise Failure(EXIT_USAGE, "refusing to write the passphrase to a terminal (use --allow-tty to override)")
+    config = load_config(args.config)
+    host = config.host(args.host)
+    token = config.token_for(host, args.token)
+    secret = derive_passphrase(token, host, args.device)
+    sys.stdout.buffer.write(secret)
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def cmd_unlock(args):
+    config = load_config(args.config)
+    host = config.host(args.host)
+    token = config.token_for(host, args.token)
+    ssh = find_tool("ssh", EXIT_SSH)
+    find_tool("fido2-assert", EXIT_TOKEN)
+    if not (args.device or token.device):
+        find_tool("fido2-token", EXIT_TOKEN)  # needed to find the device; report it before the wait
+
+    # 1. Plain TCP probe only: an empty SSH session would count as a failed attempt.
+    #    With "probe = no" (host behind a jump host or an ssh config alias)
+    #    there is nothing this tool can probe directly, so it does not wait.
+    if host.probe:
+        say(f"waiting for {host.host} port {host.port}")
+        if not wait_for_port(host.host, host.port, args.wait):
+            try:
+                socket.getaddrinfo(host.host, host.port)
+            except OSError as exc:
+                raise Failure(EXIT_TIMEOUT, f"{host.host} cannot be resolved ({exc.strerror or exc})") from None
+            raise Failure(EXIT_TIMEOUT, f"{host.host} port {host.port} did not open within {args.wait:g} s")
+    else:
+        say(f"not probing {host.host} port {host.port} (probe = no)")
+
+    # 2. PIN and touch happen here. On failure the server is never contacted.
+    secret = derive_passphrase(token, host, args.device)
+
+    # 3. One ssh session per passphrase prompt of the initramfs, at most
+    #    "prompts" sessions. cryptroot-unlock prints "Please unlock disk NAME"
+    #    right before it reads the passphrase and exits 0 once that device is
+    #    open; without that line nothing was read. The loop ends early when no
+    #    device is waiting any more or the initramfs has moved on.
+    argv = unlock_argv(ssh, host)
+    accepted = 0
+    unknown = None  # why the outcome of the last session is not known, if so
+    for attempt in range(1, host.prompts + 1):
+        if accepted and host.probe and not port_open(host.host, host.port):
+            say(f"{host.host} port {host.port} is closed: the initramfs has moved on")
+            break
+        count = f" (submission {attempt} of at most {host.prompts})" if host.prompts > 1 else ""
+        say(f"sending the passphrase to {host.host}{count}")
+        reply = ssh_run(argv, secret)
+        status = reply.status
+        prompted = UNLOCK_PROMPT in reply.output
+        before = f" after {accepted} accepted submission(s)" if accepted else ""
+        if status == 0 and prompted:
+            accepted += 1
+        elif status == 0:
+            if not accepted:
+                raise Failure(EXIT_REJECTED, "no device was waiting for a passphrase: the server did not test the "
+                              "passphrase (it may have been unlocked by other means)")
+            say("no further device is waiting for a passphrase")
+            break
+        elif transport_failed(status) and not prompted:
+            if not accepted:
+                # Connection, host key or authentication failed before the
+                # remote command ran: there is no boot to wait for.
+                cause = reply.ended or "connection, host key or authentication problem"
+                raise Failure(EXIT_SSH, f"ssh failed (exit status {status}) before the server asked for the "
+                              f"passphrase: {cause}")
+            if host.probe and port_open(host.host, host.port):
+                raise Failure(EXIT_SSH, f"submission {attempt} could not be delivered (ssh exit status {status})"
+                              f"{before}, although {host.host} port {host.port} still answers")
+            say("the initramfs no longer answers: it has moved on")
+            break
+        elif transport_failed(status):
+            unknown = f"the ssh connection was lost (exit status {status}) after the passphrase was delivered"
+            break
+        elif prompted and UNLOCK_GAVE_UP in reply.errors:
+            unknown = "cryptroot-unlock stopped waiting for cryptsetup before the result was known"
+            break
+        elif prompted:
+            raise Failure(EXIT_REJECTED, f"passphrase rejected by the server (remote exit status {status}){before}")
+        elif accepted:
+            unknown = f"the server did not ask for another passphrase (remote exit status {status})"
+            break
+        else:
+            raise Failure(EXIT_REJECTED, f"the server did not take the passphrase (remote exit status {status}, no "
+                          "unlock prompt seen): it was probably never tested; see the remote message above and try again")
+    secret = None  # not needed any more
+    if unknown:
+        say(f"{unknown}{' after ' + str(accepted) + ' accepted submission(s)' if accepted else ''}")
+    else:
+        say("passphrase accepted" if accepted == 1 else f"passphrase accepted ({accepted} submissions)")
+
+    # 4. Optional confirmation through the port of the running system. It may
+    #    have an address other than that of the initramfs (two leases), so the
+    #    check goes to admin_host. On the same machine and port the SSH
+    #    service of the initramfs would answer; nothing can be confirmed then.
+    up_host = host.admin_host
+    confirm = (host.probe and host.booted_port is not None
+               and not (host.booted_port == host.port and same_machine(up_host, host.host)))
+    if not confirm:
+        if unknown:
+            raise Failure(EXIT_SSH if transport_failed(status) else EXIT_REJECTED,
+                          "cannot tell whether the server was unlocked (the start cannot be confirmed: no "
+                          "booted_port, probe = no, or the same port on the same machine)")
+        return 0
+    say(f"waiting for {up_host} port {host.booted_port}")
+    if wait_for_port(up_host, host.booted_port, args.boot_timeout):
+        say(f"{up_host} is up (port {host.booted_port} is open)")
+        return 0
+    limit = f"{up_host} port {host.booted_port} did not open within {args.boot_timeout:g} s"
+    if unknown:
+        raise Failure(EXIT_SSH if transport_failed(status) else EXIT_REJECTED, f"{limit}, and {unknown}")
+    raise Failure(EXIT_TIMEOUT, limit)
+
+
+def remove_remote_file(ssh, host, remote_file, certain):
+    """Remove the uploaded key file. Says so loudly if that does not work.
+
+    certain tells whether the file is known to exist. The termination
+    signals are ignored meanwhile: a second Ctrl-C must not end the removal.
+    The ssh defaults bound the time it can take.
+    """
+    removed = False
+    try:
+        with signals_ignored():
+            removed = ssh_run(admin_argv(ssh, host, as_root(host, "rm -f " + shlex.quote(remote_file)))).status == 0
+    finally:
+        if not removed and certain:
+            say(f"WARNING: COULD NOT REMOVE {remote_file} ON {host.admin_host}. IT CONTAINS THE LUKS "
+                f"PASSPHRASE. Remove it by hand: rm -f {shlex.quote(remote_file)}")
+        elif not removed:
+            say(f"WARNING: could not make sure that {remote_file} does not exist on {host.admin_host}. If it "
+                f"exists, it contains the LUKS passphrase. Check by hand: rm -f {shlex.quote(remote_file)}")
+    return removed
+
+
+def keyslot_note(reply):
+    """The keyslot number that cryptsetup --verbose reported, for a message."""
+    found = KEYSLOT_RE.search(reply.output) or KEYSLOT_RE.search(reply.errors)
+    return f" (keyslot {found.group(1).decode()})" if found else ""
+
+
+def cmd_enroll(args):
+    config = load_config(args.config)
+    host = config.host(args.host)
+    token = config.token_for(host, args.token)
+    ssh = find_tool("ssh", EXIT_SSH)
+    find_tool("fido2-assert", EXIT_TOKEN)
+    if not (args.device or token.device):
+        find_tool("fido2-token", EXIT_TOKEN)  # needed to find the device
+    devices = [check_server_path(dev, "--device-on-server") for dev in args.device_on_server or []]
+    devices = devices or host.devices
+    existing = args.existing_keyfile and check_server_path(args.existing_keyfile, "--existing-keyfile")
+
+    def remote(command, **options):
+        """An ssh run on the running system, as root."""
+        return ssh_run(admin_argv(ssh, host, as_root(host, command)), **options)
+
+    if not devices:
+        say(f"LUKS devices on {host.admin_host}:")
+        status = remote("blkid -t TYPE=crypto_LUKS -o device").status
+        if transport_failed(status):
+            raise Failure(EXIT_SSH, f"ssh to {host.admin_host} failed (exit status {status})")
+        raise Failure(EXIT_USAGE, f"no LUKS devices configured; set 'devices' in [host {host.name}] "
+                      "or pass --device-on-server")
+
+    # 1. Before PIN and touch are spent: the running system must be reachable,
+    #    the commands must run without a password prompt, and every device
+    #    must be a LUKS device.
+    for device in devices:
+        status = remote("cryptsetup isLuks " + shlex.quote(device)).status
+        if transport_failed(status):
+            raise Failure(EXIT_SSH, f"ssh to {host.admin_host} failed (exit status {status})")
+        if status != 0:
+            raise Failure(EXIT_REJECTED, f"{device} cannot be used on {host.admin_host}: it is not a LUKS device, "
+                          f"or the command could not be run as root (exit status {status})")
+
+    # 2. PIN and touch.
+    secret = derive_passphrase(token, host, args.device)
+
+    failed = []
+    transport = False
+
+    def fail(device, step, status):
+        nonlocal transport
+        say(f"{device}: failed ({step} exit status {status})")
+        failed.append(device)
+        transport = transport or transport_failed(status)
+
+    # 3. Which devices lack the passphrase? cryptsetup reads it from stdin,
+    #    the way unlock delivers it, so the test does not depend on the key
+    #    file of step 4. A passphrase that already opens a device is not added
+    #    again: a repeated run must not leave several keyslots with it.
+    test = "cryptsetup open --test-passphrase --disable-external-tokens --verbose --key-file - "
+    missing = []
+    for device in devices:
+        say(f"{device}: checking whether a keyslot already opens with this passphrase")
+        reply = remote(test + shlex.quote(device), secret=secret, echo=False)
+        if reply.status == 0:
+            say(f"{device}: already enrolled{keyslot_note(reply)}")
+        elif reply.status == CRYPTSETUP_NO_KEY:
+            missing.append(device)
+        else:
+            echo_remote(reply.output)
+            fail(device, "the check ended with", reply.status)
+
+    # 4. Add a keyslot where it is missing, and verify it.
+    remote_file = "/run/kaltstart-enroll-" + secrets.token_hex(8)
+    quoted = shlex.quote(remote_file)
+    uploaded = stored = False
+    try:
+        if missing and not existing:
+            # cryptsetup asks for an existing passphrase on the terminal, so
+            # the new one cannot come from stdin. It is put into a file that
+            # only root can read, and the file is compared with what was sent
+            # before a keyslot is made from it.
+            upload = f"umask 077 && cat > {quoted}"
+            if host.admin_sudo:
+                upload = "sudo -n sh -c " + shlex.quote(upload)
+            uploaded = True
+            status = ssh_run(admin_argv(ssh, host, upload), secret).status
+            if status != 0:
+                raise Failure(EXIT_SSH, f"uploading the key file to {host.admin_host} failed (ssh exit status {status})")
+            stored = True
+            reply = remote(f"sha256sum {quoted}", echo=False)
+            if reply.status != 0 or reply.output.split()[:1] != [hashlib.sha256(secret).hexdigest().encode("ascii")]:
+                raise Failure(EXIT_SSH, f"the key file on {host.admin_host} does not hold the passphrase that was "
+                              "sent; no keyslot was added")
+        for device in missing:
+            target = shlex.quote(device)
+            say(f"{device}: none yet, adding a keyslot")
+            if existing:
+                add = f"cryptsetup luksAddKey --key-file {shlex.quote(existing)} --new-keyfile - {target}"
+                status = remote(add, secret=secret).status
+            else:
+                add = as_root(host, f"cryptsetup luksAddKey --new-keyfile {quoted} {target}", interactive=True)
+                status = ssh_terminal(admin_argv(ssh, host, add, tty=True))
+            if status != 0:
+                fail(device, "luksAddKey", status)
+                continue
+            say(f"{device}: added")
+            reply = remote(test + target, secret=secret, echo=False)
+            if reply.status != 0:
+                echo_remote(reply.output)
+                fail(device, "verification", reply.status)
+                continue
+            say(f"{device}: verified{keyslot_note(reply)}")
+    finally:
+        removed = not uploaded or remove_remote_file(ssh, host, remote_file, stored)
+    if not removed:
+        raise Failure(EXIT_SSH, "the key file may still be on the server"
+                      + (f"; enrollment failed for: {', '.join(failed)}" if failed else ""))
+    if failed:
+        raise Failure(EXIT_SSH if transport else EXIT_REJECTED, "enrollment failed for: " + ", ".join(failed))
+    say(f"enrollment complete for {len(devices)} device(s)"
+        + ("; the key file was removed from the server" if uploaded else ""))
+    return 0
+
+
+def cmd_check(args):
+    """Local checks only: the token is not used and no SSH login takes place."""
+    passed = []
+
+    def report(ok, text):
+        passed.append(bool(ok))
+        say(("ok:   " if ok else "FAIL: ") + text)
+
+    try:
+        _, problem = access_problem(os.stat(args.config))
+        report(not problem, f"configuration file {args.config}" + (f" {problem}" if problem else ""))
+        directory = os.path.dirname(args.config) or "."
+        if stat.S_IMODE(os.stat(directory).st_mode) & 0o022:
+            report(False, f"directory {directory} is writable by group or others")
+    except OSError as exc:
+        report(False, f"configuration file {args.config}: {exc.strerror}")
+    for tool in ("fido2-assert", "fido2-token", "ssh", "ssh-keygen"):
+        report(shutil.which(tool), f"executable {tool}")
+
+    host = None
+    try:
+        config = load_config(args.config, warn=False)
+        host = config.host(args.host)
+        report(True, f"[host {host.name}] is valid")
+    except Failure as exc:
+        report(False, str(exc))
+    if host is None:
+        return EXIT_USAGE
+    try:
+        report(True, f"[token {config.token_for(host, None).name}] is valid")
+    except Failure as exc:
+        report(False, str(exc))
+    if host.identity:
+        report(os.path.isfile(host.identity), f"identity file {host.identity}")
+    if host.known_hosts:
+        report(os.path.isfile(host.known_hosts), f"known_hosts file {host.known_hosts}")
+
+    lookup = host.host if host.port == 22 else f"[{host.host}]:{host.port}"
+    keygen = shutil.which("ssh-keygen")
+    if keygen:
+        argv = [keygen, "-F", lookup] + (["-f", host.known_hosts] if host.known_hosts else [])
+        show_command(argv)
+        found = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL).returncode == 0
+        report(found, f"known_hosts entry for {lookup}")
+    others = hosts_with_salt_of(config, host.name)
+    if others:
+        say(f"note: [host {host.name}] has the same salt as [host {'], [host '.join(others)}]; with the same "
+            "token they share one passphrase, which is intended only for sections that describe the same server")
+    return 0 if all(passed) else EXIT_USAGE
+
+
+def cmd_list(args):
+    config = load_config(args.config)
+
+    def short(text):
+        return text if len(text) <= 12 else text[:8] + "..."
+
+    for name in config.tokens:
+        token = config.token(name)
+        print(f"token {name}: rp_id={escape_control(token.rp_id)} credential_id={short(token.credential_id)} "
+              f"pin={'yes' if token.pin else 'no'} device={escape_control(token.device or 'auto')}")
+    reported = set()
+    for name in config.hosts:
+        host = config.host(name)
+        if host.token:
+            config.token(host.token)  # the section must exist and be valid
+        booted = f" booted_port={host.booted_port}" if host.booted_port else ""
+        booted += "" if host.probe else " probe=no"
+        print(f"host {name}: {host.user}@{host.host} port={host.port}{booted} token={host.token or '(not set)'} "
+              f"salt={short(host.salt)} prompts={host.prompts} devices={','.join(host.devices) or 'none'}")
+        others = hosts_with_salt_of(config, name)
+        if others and name not in reported:
+            reported.update(others)
+            say(f"warning: [host {name}] and [host {'], [host '.join(others)}] have the same salt; with the same "
+                "token they share one passphrase, which is intended only for sections that describe the same server")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+def seconds(text):
+    value = float(text)
+    if not 0 <= value <= 86400 * 365:  # also rejects NaN
+        raise argparse.ArgumentTypeError("must be a number of seconds between 0 and 31536000 (one year)")
+    return value
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="kaltstart",
+        description="Unlock LUKS-encrypted servers over SSH with a FIDO2 token that stays on the workstation.")
+    parser.add_argument("--config", metavar="PATH",
+                        help="configuration file (default: $XDG_CONFIG_HOME/kaltstart/config.ini, "
+                             "or ~/.config/kaltstart/config.ini)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="print the command lines that are run")
+    parser.add_argument("--version", action="version", version=__version__)
+    commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
+
+    def command(name, func, help_text, token_options=False):
+        sub = commands.add_parser(name, help=help_text, description=help_text)
+        sub.set_defaults(func=func)
+        if token_options:
+            sub.add_argument("host", metavar="HOST", help="name of a [host ...] section")
+            sub.add_argument("--token", metavar="T", help="name of the [token ...] section to use")
+            sub.add_argument("--device", metavar="DEV", help="FIDO2 device, for example /dev/hidraw5 (default: auto-detect)")
+        return sub
+
+    sub = command("init", cmd_init, "create a credential on the token and append a [token ...] section")
+    sub.add_argument("--token", metavar="NAME", default="main", help="name of the token section (default: main)")
+    sub.add_argument("--rp-id", metavar="ID", default="kaltstart", help="relying party ID (default: kaltstart)")
+    sub.add_argument("--device", metavar="DEV", help="FIDO2 device (default: auto-detect)")
+    sub.add_argument("--no-pin", action="store_true",
+                     help="create a credential that is used without the PIN, and write pin = no")
+
+    sub = command("add-host", cmd_add_host, "append a [host ...] section with a new random salt")
+    sub.add_argument("name", metavar="NAME", help="name of the new [host ...] section")
+    sub.add_argument("--host", metavar="H", required=True, help="host name or address of the server in the initramfs")
+    sub.add_argument("--port", metavar="N", default="22", help="SSH port of the initramfs (default: 22)")
+    sub.add_argument("--user", metavar="U", default="root", help="login user of the initramfs (default: root)")
+    sub.add_argument("--identity", metavar="F", help="SSH private key for the initramfs")
+    sub.add_argument("--known-hosts", metavar="F", help="known_hosts file that contains the host key of the initramfs")
+    sub.add_argument("--booted-port", metavar="N", help="SSH port of the running system, used to confirm the start")
+    sub.add_argument("--token", metavar="T", help="token section used for this host")
+    sub.add_argument("--device-on-server", metavar="DEV", action="append",
+                     help="LUKS device on the server; may be given several times")
+
+    sub = command("enroll", cmd_enroll, "add the passphrase to the LUKS devices of the running system", token_options=True)
+    sub.add_argument("--device-on-server", metavar="DEV", action="append",
+                     help="LUKS device on the server; may be given several times")
+    sub.add_argument("--existing-keyfile", metavar="PATH_ON_SERVER",
+                     help="key file on the server that opens an existing keyslot")
+
+    sub = command("unlock", cmd_unlock, "derive the passphrase and submit it to cryptroot-unlock over SSH",
+                  token_options=True)
+    sub.add_argument("--wait", metavar="SECONDS", type=seconds, default=600.0,
+                     help="time limit for the SSH port of the initramfs (default: 600; 0 = a single attempt)")
+    sub.add_argument("--boot-timeout", metavar="SECONDS", type=seconds, default=300.0,
+                     help="time limit for booted_port after the unlock (default: 300)")
+
+    sub = command("derive", cmd_derive, "write the passphrase for HOST to standard output", token_options=True)
+    sub.add_argument("--allow-tty", action="store_true", help="permit output to a terminal")
+
+    sub = command("check", cmd_check, "validate the local configuration for HOST (the token is not used, no SSH login)")
+    sub.add_argument("host", metavar="HOST", help="name of a [host ...] section")
+
+    command("list", cmd_list, "print the configured tokens and hosts")
+    return parser
+
+
+def main(argv=None):
+    global VERBOSE
+    args = build_parser().parse_args(argv)
+    VERBOSE = args.verbose
+    args.config = args.config or default_config_path()
+    # No core file: it would hold the passphrase. ssh and the fido2 tools
+    # inherit the limit.
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ValueError, OSError):
+        pass
+    # Treat SIGTERM, SIGHUP and SIGQUIT like Ctrl-C, so that cleanup (the key
+    # file that enroll puts on the server, temporary directories) still runs.
+    # A signal that was ignored when the program started stays ignored.
+    for signum in TERMINATION_SIGNALS:
+        if signal.getsignal(signum) is signal.SIG_DFL:
+            signal.signal(signum, signal.default_int_handler)
+    try:
+        status = args.func(args)
+        sys.stdout.flush()
+        return status
+    except Failure as exc:
+        say(str(exc))
+        return exc.code
+    except KeyboardInterrupt:
+        say("interrupted")
+        return 130
+    except BrokenPipeError:
+        # The reader of stdout has gone. Point stdout elsewhere, so that the
+        # interpreter does not fail a second time when it exits.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
+        say("the output could not be written (broken pipe)")
+        return 1
+    except Exception as exc:  # unexpected: one line, traceback only with --verbose
+        say(f"internal error: {type(exc).__name__}: {escape_control(str(exc))}")
+        if VERBOSE:
+            traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
